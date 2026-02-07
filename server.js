@@ -16,9 +16,6 @@ app.use(fileUpload());
 app.use(express.static('public')); // For student upload page
 
 // MEMORY DB (Resets on restart)
-// Tracks the 6 States: 
-// REVIEW_PENDING, REVIEW_ACCEPTED, REVIEW_REJECTED
-// APPROVAL_PENDING, APPROVAL_ACCEPTED, APPROVAL_REJECTED
 global.db = {}; 
 
 // ==========================================
@@ -29,16 +26,31 @@ app.post('/upload', async (req, res) => {
         if (!req.files || !req.files.document) return res.status(400).send('No file.');
 
         const file = req.files.document;
-        const docId = `doc_${Date.now()}`;
         const content = file.data.toString('utf8');
+        const docId = `doc_${Date.now()}`;
+        const upperContent = content.toUpperCase();
 
-        // 1. ASK WORKFLOW: Which Department? 
-        // (Returns: 'scholarships', 'internships', 'admission', or 'certifications')
+        // 🚨 STRICT FORMAT VALIDATION (The Bouncer)
+        const hasName    = upperContent.includes("STUDENT NAME:");
+        const hasDOB     = upperContent.includes("DATE OF BIRTH:");
+        const hasSubject = upperContent.includes("SUBJECT:");
+        // Regex ensures "DATE:" is found but ignores "DATE OF BIRTH:"
+        const hasDate    = /DATE:(?!\s*OF\s*BIRTH)/i.test(content); 
+
+        if (!hasName || !hasDOB || !hasDate || !hasSubject) {
+            console.log(`[SERVER] ❌ REJECTED: ${file.name} (Missing Required Headers)`);
+            return res.status(400).json({ 
+                success: false, 
+                status: 'REJECTED',
+                message: "Format Error: File must contain 'STUDENT NAME:', 'DATE OF BIRTH:', 'DATE:', and 'SUBJECT:'" 
+            });
+        }
+
+        // ✅ FORMAT PASSED: PROCEED TO AI
         const targetDept = workflow.determineDepartment(content); 
-
         console.log(`[SERVER] Received: ${file.name} -> Routing to: ${targetDept}`);
 
-        // 2. SAVE TO DB (Initial Status: REVIEW_PENDING)
+        // SAVE TO DB
         global.db[docId] = {
             docId: docId,
             fileName: file.name,
@@ -48,23 +60,22 @@ app.post('/upload', async (req, res) => {
             history: [`Uploaded at ${new Date().toLocaleTimeString()}`]
         };
 
-        // 3. PUSH TO REDIS (The Reviewer Queue)
-        // We push to the "Reviewer" queue of that specific department
-        // Queue name example: "queue:scholarships:review"
+        // PUSH TO REDIS
         await injector.pushToQueue(`${targetDept}:review`, global.db[docId]);
 
-        // 4. SIGNAL THE EXE (Silent Data Packet)
-        // The Server sends a signal to the specific room (e.g., room_scholarships).
-        // It says: "Type: REVIEW" so the EXE puts it in the Left Column.
+        // SIGNAL THE EXE (Reviewer Column)
         io.to(`room_${targetDept}`).emit('NEW_JOB', {
             type: 'REVIEW', 
             docId: docId,
-            fileName: file.name,   // <--- ADDED
+            fileName: file.name,
             content: content,
             message: `New document pending review.`
         });
 
-        res.json({ success: true, docId: docId, department: targetDept });
+        // 🔔 TERMINAL LOG
+        console.log(`[SERVER] 🔔 Notification sent to ${targetDept.toUpperCase()} Reviewer!`);
+
+        res.json({ success: true, docId: docId, department: targetDept, status: 'ACCEPTED' });
 
     } catch (err) {
         console.error(err);
@@ -77,15 +88,14 @@ app.post('/upload', async (req, res) => {
 // ==========================================
 io.on('connection', (socket) => {
     
-    // STEP A: The EXE connects and identifies itself
-    // e.g., Scholarships.exe says "I am scholarships"
+    // STEP A: The EXE identifies itself
     socket.on('IDENTIFY_DEPT', (deptName) => {
         const roomName = `room_${deptName}`;
         socket.join(roomName);
         console.log(`[SOCKET] Department Connected: ${deptName}`);
     });
 
-    // STEP B: The EXE sends a Decision (Reviewer Approved/Rejected)
+    // STEP B: Process Reviewer/Admin Decisions
     socket.on('PROCESS_DECISION', async (data) => {
         const { docId, department, role, action } = data;
         const doc = global.db[docId];
@@ -98,31 +108,27 @@ io.on('connection', (socket) => {
         if (role === 'REVIEWER') {
             if (action === 'REJECT') {
                 doc.status = 'REVIEW_REJECTED';
-                // Update History
                 doc.history.push('Rejected by Reviewer');
-                // Signal EXE to update UI
                 io.emit('STATUS_UPDATE', { docId, status: 'REVIEW_REJECTED' });
             } 
             else if (action === 'APPROVE') {
-                // 1. Update Status
-                doc.status = 'REVIEW_ACCEPTED';
+                doc.status = 'APPROVAL_PENDING'; 
                 doc.history.push('Accepted by Reviewer');
                 io.emit('STATUS_UPDATE', { docId, status: 'REVIEW_ACCEPTED' });
 
-                // 2. AUTOMATIC HANDOFF TO ADMIN (The Magic Part)
-                doc.status = 'APPROVAL_PENDING'; 
-                
-                // Push to Admin Queue in Redis (queue:scholarships:admin)
+                // HANDOFF TO ADMIN
                 await injector.pushToQueue(`${department}:admin`, doc);
 
-                // Signal the SAME EXE to show it in the Right (Admin) Column
                 io.to(`room_${department}`).emit('NEW_JOB', {
                     type: 'ADMIN',
                     docId: docId,
-                    fileName: doc.fileName, // <--- ADDED
+                    fileName: doc.fileName,
                     content: doc.content,
                     message: "Review passed. Ready for Admin."
                 });
+                
+                // 🔔 TERMINAL LOG
+                console.log(`[SERVER] 🔔 Notification sent to ${department.toUpperCase()} Admin!`);
             }
         }
 
